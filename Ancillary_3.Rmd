@@ -1,0 +1,165 @@
+---
+title: "Forecasting football injuries by combining screening, monitoring and machine learning - 3/4 Ancillary Data analysis"
+author: "Anne Hecksteden & Georges Pierre Schmartz"
+date: "04 May 2022"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: FALSE
+      smooth_scroll: FALSE
+    toc_depth: 5
+
+---
+
+```{r setup, echo=TRUE,message=FALSE,warning=FALSE}
+# clean workspace if needed
+rm(list = ls())
+source("utils.R")
+data<-get_main_data()
+data_test<-data$data_test
+data_training<-data$data_training
+
+# Work with multiple threads (use all of the available ones)
+cl <- makePSOCKcluster(ceiling(detectCores()/2))
+registerDoParallel(cl)
+```
+
+# Ancillary analysis 3: noROSE (main model but without upsampling)
+
+## Fit gradient boosted model 
+
+Model fitting with leave-one-player-out stratified cross-validation 
+Only difference to main model: no upsampling
+
+```{r Baseline model fitting, eval=TRUE, echo=TRUE}
+
+trainctrl_noROSE <- trainControl(method = "repeatedcv", number = data$player_in_training, repeats = 10, summaryFunction = twoClassSummary, classProbs = TRUE, savePredictions = TRUE, index=data$CV_folds) # sampling = rose_upsampling has been removed from trainctrl
+
+set.seed(42)
+gbm_tree_auto_noROSE <- train(Crit ~ ., data = data_training, method = "gbm", metric = "ROC", trControl = trainctrl_noROSE, verbose = FALSE, tuneGrid = gbmGrid) 
+
+# Show model
+gbm_tree_auto_noROSE
+```
+
+### Get cross-validation performance metrics
+#### ROC curve 
+
+```{r ROC curve noRose cv, eval=TRUE, echo=TRUE}
+
+# Extract from fit object
+predicted <- as.data.frame(gbm_tree_auto_noROSE$pred$pred)
+observed <- as.data.frame(gbm_tree_auto_noROSE$pred$obs)
+prob_no <- as.data.frame(gbm_tree_auto_noROSE$pred$No)
+prob_yes <- as.data.frame(gbm_tree_auto_noROSE$pred$Yes)
+
+# Assemble and reformat cv results
+cv_roc_noROSE <- cbind(predicted, observed, prob_no, prob_yes)
+names(cv_roc_noROSE) <- c("pred", "obs", "prob_no", "prob_yes")
+cv_roc_noROSE$obs_i <- cv_roc_noROSE$obs == "Yes"
+
+temporary<-generate_rocs(cv_roc_noROSE)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+#### Brier score
+```{r Brier score noROSE cv, eval=TRUE, echo=TRUE}
+temporary<-compute_brier(cv_roc_noROSE)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+```
+
+### Calibration plot
+
+```{r Calibration plot noRose cv, eval=TRUE, echo=TRUE}
+temporary<-generate_calibration_plot(input_data = cv_roc_noROSE,recalibration_data = data_training)
+# Calibration plot for raw probability predictions
+temporary[["calibration"]]
+## Check
+temporary[["recalibration_check"]]
+
+# Calibration plot after recalibration 
+temporary[["recalibrated_calibration"]]
+```
+
+## Get testset predictions
+
+```{r noROSE test set, eval=TRUE, echo=TRUE}
+
+# Apply to test set
+Predicted_noROSE <- predict(gbm_tree_auto_noROSE, newdata=data_test)
+
+# View predictions for the test set
+Predicted_noROSE <- data.frame(Predicted_noROSE)
+
+# Merge with testset
+data_test_plus_noROSE <- cbind(data_test, Predicted_noROSE)
+data_test_plus_noROSE$Predicted_noROSE <- factor(data_test_plus_noROSE$Predicted_noROSE, levels = c("No", "Yes"))
+
+# Check confusion matrix
+table(data_test_plus_noROSE$Crit, data_test_plus_noROSE$Predicted_noROSE)
+
+# Get probabilities
+Predicted_noROSEp <- predict(gbm_tree_auto_noROSE, newdata=data_test, type = "prob")
+colnames(Predicted_noROSEp) <- c("prob_no", "prob_yes") 
+
+# Merge
+data_test_plus_noROSE <- cbind(data_test_plus_noROSE, Predicted_noROSEp)
+data_test_plus_noROSE$Predicted <- factor(data_test_plus_noROSE$Predicted, levels = c("No", "Yes"))
+
+# Plot
+ggplot(data_test_plus_noROSE, aes(x=Crit, y=prob_yes, color = Crit))+ geom_jitter(alpha=0.1,size=0.6,shape=16)+ geom_boxplot(outlier.shape = NA,fill=NA)   + ggtitle("Probs. for test set")+guides(color="none")+ggplot_theme+scale_y_continuous(expand=c(0,0),limits = c(0,1))
+
+ggplot(data_test_plus_noROSE, aes(x=Day_in_study, y=prob_yes) ) + geom_line() +facet_wrap(~ID,ncol = 3) +scale_y_continuous(limits = c(0,1),breaks = c(0,0.5,1))+ggplot_theme+theme(strip.background = element_blank(),strip.text = element_text(size=6),panel.spacing = unit(0, "lines"))+scale_x_continuous(expand=c(0,0))
+
+```
+
+## Testset performance
+
+### ROC curve
+
+```{r ROC curve main noRose, eval=TRUE, echo=TRUE}
+# ROC curve with confidence interval
+temporary<-generate_rocs(data_test_plus_noROSE)
+# ROC curve with confidence interval
+temporary$roc_plot
+# ROC-AUC
+temporary$auc
+# ROC-AUC confidence interval
+temporary$auc_ci
+```
+
+
+### Brier score
+```{r nRose test Brier, eval=TRUE, echo=TRUE}
+
+data_test_plus_noROSE$CritL <- data_test_plus_noROSE$Crit == "Yes"
+data_test_plus_noROSE$CritL <- as.numeric(data_test_plus_noROSE$CritL)
+
+temporary<-compute_brier(data_test_plus_noROSE)
+## Brier score
+temporary$Brier_score
+
+### Check distribution of Brier scores 
+temporary$Brier_score_dist
+  
+### Bootstrap confidence interval for Brier score 
+temporary$Brier_bootstrap_trainset
+  
+temporary$Brier_ci
+#End Parallel Computation
+stopCluster(cl)
+registerDoSEQ()
+```
